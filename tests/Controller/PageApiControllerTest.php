@@ -153,7 +153,7 @@ final class PageApiControllerTest extends WebTestCase
 
     public function testPutWithMatchingIfMatchUpdatesPage(): void
     {
-        // Create as draft (no publishedAt) so the workflow gate doesn't route us to PendingModification.
+        // Create as draft (no publishedAt).
         [$host, $slug] = $this->createTestPage(['publishedAt' => null]);
 
         // Re-fetch to get the canonical revision (DB roundtrip may truncate microseconds).
@@ -181,29 +181,6 @@ final class PageApiControllerTest extends WebTestCase
         self::assertIsArray($fresh['frontmatter']);
         self::assertSame('Updated H1', $fresh['frontmatter']['h1']);
         self::assertSame('New body content', $fresh['body']);
-    }
-
-    public function testPutPublishedPageRoutesToPendingModification(): void
-    {
-        // Default create publishes the page; workflow gate should then intercept the PUT.
-        [$host, $slug] = $this->createTestPage();
-        $this->request('GET', '/api/page/'.$host.'/'.$slug);
-        $current = $this->decode();
-        self::assertIsString($current['revision']);
-        $revision = $current['revision'];
-
-        $response = $this->request('PUT', '/api/page/'.$host.'/'.$slug, [
-            'frontmatter' => ['h1' => 'Through workflow'],
-        ], ['HTTP_IF_MATCH' => $revision]);
-
-        self::assertSame(202, $response->getStatusCode());
-        $body = $this->decode();
-        self::assertArrayHasKey('pendingModification', $body);
-        self::assertArrayHasKey('page', $body);
-        self::assertIsArray($body['page']);
-        self::assertIsArray($body['page']['frontmatter']);
-        // Page itself wasn't mutated — h1 should be unchanged from the create-time value.
-        self::assertSame('Test', $body['page']['frontmatter']['h1']);
     }
 
     public function testPreviewRendersMarkdown(): void
@@ -406,25 +383,6 @@ final class PageApiControllerTest extends WebTestCase
         self::assertSame('Only Frontmatter', $fresh['frontmatter']['h1']);
     }
 
-    public function testPatchPublishedPageRoutesToPendingModification(): void
-    {
-        // Default create publishes the page; the workflow gate should intercept the PATCH.
-        [$host, $slug] = $this->createTestPage();
-        $revision = $this->currentRevision($host, $slug);
-
-        $response = $this->request('PATCH', '/api/page/'.$host.'/'.$slug, [
-            'edits' => [['find' => 'Hello', 'replace' => 'Hi']],
-        ], ['HTTP_IF_MATCH' => $revision]);
-
-        self::assertSame(202, $response->getStatusCode());
-        $body = $this->decode();
-        self::assertArrayHasKey('pendingModification', $body);
-
-        // Page body itself wasn't mutated.
-        $this->request('GET', '/api/page/'.$host.'/'.$slug);
-        self::assertSame('Hello', $this->decode()['body']);
-    }
-
     public function testGetUnknownPageReturns404(): void
     {
         $response = $this->request('GET', '/api/page/nope.example.com/nothing-here');
@@ -486,8 +444,7 @@ final class PageApiControllerTest extends WebTestCase
     }
 
     /**
-     * Create a draft page (no publishedAt, so the workflow gate stays out of the
-     * way) with a known body, returning [host, slug].
+     * Create a draft page (no publishedAt) with a known body, returning [host, slug].
      *
      * @return array{0: string, 1: string}
      */
