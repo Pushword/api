@@ -14,6 +14,10 @@ use PHPUnit\Framework\Attributes\Group;
 use Pushword\Api\Service\InvalidFrontmatterException;
 use Pushword\Api\Service\PageFrontmatterMapper;
 use Pushword\Core\Entity\Page;
+use Pushword\Core\Repository\MediaRepository;
+use Pushword\Core\Repository\PageRepository;
+use Pushword\Core\Service\EditorialTimezone;
+use Pushword\Core\Site\SiteRegistry;
 use Pushword\Flat\Converter\PublishedAtConverter;
 use Symfony\Bundle\FrameworkBundle\Test\KernelTestCase;
 
@@ -497,6 +501,9 @@ final class PageFrontmatterMapperTest extends KernelTestCase
     {
         yield 'flat Y-m-d H:i' => ['2026-04-09 10:00'];
         yield 'iso 8601' => ['2026-04-09T10:00:00+00:00'];
+        // Stored as the server wall clock of the same instant, since Doctrine drops the offset.
+        yield 'iso 8601 with an offset' => ['2026-04-09T12:00:00+02:00'];
+        yield 'flat export with an offset' => ['2026-04-09 12:00+02:00'];
     }
 
     #[DataProvider('publishedAtFormatProvider')]
@@ -599,6 +606,68 @@ final class PageFrontmatterMapperTest extends KernelTestCase
         self::assertNull($page->extendedPage);
     }
 
+    public function testDatesAreReturnedOnTheEditorialClockAndReadBackToTheSameInstant(): void
+    {
+        $mapper = $this->mapperOnTheClockOf('Europe/Paris');
+
+        $page = new Page();
+        $page->host = 'example.com';
+        $page->slug = 'clock';
+        $page->publishedAt = new DateTime('2026-09-30 14:00:00 UTC');
+        // The second 02:30 of the autumn change: only the offset tells it apart.
+        $page->holdPublicationAt = new DateTime('2026-10-25 01:30:00 UTC');
+
+        $frontmatter = $mapper->toArray($page)['frontmatter'];
+        self::assertSame('2026-09-30T16:00:00+02:00', $frontmatter['publishedAt']);
+        self::assertSame('2026-10-25T02:30:00+01:00', $frontmatter['holdPublicationAt']);
+
+        $copy = new Page();
+        $copy->host = 'example.com';
+        $copy->slug = 'clock-copy';
+
+        $mapper->applyFrontmatter($copy, ['publishedAt' => $frontmatter['publishedAt'], 'holdPublicationAt' => $frontmatter['holdPublicationAt']]);
+        self::assertSame($page->publishedAt->getTimestamp(), $copy->publishedAt?->getTimestamp());
+        self::assertSame($page->holdPublicationAt->getTimestamp(), $copy->holdPublicationAt?->getTimestamp());
+    }
+
+    public function testAPayloadSentBackAsIsLeavesTheDatesUntouched(): void
+    {
+        $mapper = $this->mapperOnTheClockOf('Europe/Paris');
+
+        $page = new Page();
+        $page->host = 'example.com';
+        $page->slug = 'clock';
+
+        $publishedAt = new DateTime('2026-09-30 14:00:00 UTC');
+        $holdPublicationAt = new DateTime('2026-10-25 01:30:00 UTC');
+        $page->publishedAt = $publishedAt;
+        $page->holdPublicationAt = $holdPublicationAt;
+
+        $frontmatter = $mapper->toArray($page)['frontmatter'];
+        // Reading the page must not shift its managed dates onto the editorial clock.
+        self::assertSame('UTC', $publishedAt->getTimezone()->getName());
+        self::assertSame('UTC', $holdPublicationAt->getTimezone()->getName());
+
+        // A GET payload PUT back unchanged: a new DateTime of the same instant would
+        // still be dirty for Doctrine and bump updatedAt, hence the revision.
+        $mapper->applyFrontmatter($page, $frontmatter);
+        self::assertSame($publishedAt, $page->publishedAt);
+        self::assertSame($holdPublicationAt, $page->holdPublicationAt);
+    }
+
+    public function testUnsetDatesAreReturnedAsNull(): void
+    {
+        $page = new Page();
+        $page->host = 'example.com';
+        $page->slug = 'draft';
+        $page->publishedAt = null; // the constructor stamps it with now
+
+        $frontmatter = $this->mapperOnTheClockOf('Europe/Paris')->toArray($page)['frontmatter'];
+
+        self::assertNull($frontmatter['publishedAt']);
+        self::assertNull($frontmatter['holdPublicationAt']);
+    }
+
     public function testHoldPublicationAtAppliesAndRejectsGarbage(): void
     {
         $page = new Page();
@@ -641,6 +710,19 @@ final class PageFrontmatterMapperTest extends KernelTestCase
         }
 
         self::assertNotNull($page->publishedAt, 'a rejected date must leave the column untouched');
+    }
+
+    private function mapperOnTheClockOf(string $timezone): PageFrontmatterMapper
+    {
+        $editorialTimezone = new EditorialTimezone($timezone);
+
+        return new PageFrontmatterMapper(
+            self::getContainer()->get(PageRepository::class),
+            self::getContainer()->get(MediaRepository::class),
+            self::getContainer()->get(SiteRegistry::class),
+            new PublishedAtConverter($editorialTimezone),
+            $editorialTimezone,
+        );
     }
 
     private function persistPage(string $host, string $slug, string $locale): Page

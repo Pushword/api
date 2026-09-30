@@ -12,6 +12,7 @@ use Pushword\Core\Entity\Media;
 use Pushword\Core\Entity\Page;
 use Pushword\Core\Repository\MediaRepository;
 use Pushword\Core\Repository\PageRepository;
+use Pushword\Core\Service\EditorialTimezone;
 use Pushword\Core\Site\SiteRegistry;
 use Pushword\Flat\Converter\PropertyConverterRegistry;
 use Pushword\Flat\Converter\PublishedAtConverter;
@@ -41,6 +42,8 @@ final readonly class PageFrontmatterMapper
         private PageRepository $pageRepository,
         private MediaRepository $mediaRepository,
         private SiteRegistry $siteRegistry,
+        private PublishedAtConverter $publishedAtConverter,
+        private EditorialTimezone $editorialTimezone,
         private ?PropertyConverterRegistry $converterRegistry = null,
     ) {
     }
@@ -63,9 +66,9 @@ final readonly class PageFrontmatterMapper
             'weight' => $page->weight,
             'tags' => $page->getTagList(),
             'redirectFrom' => $page->redirectFrom,
-            'publishedAt' => $page->publishedAt?->format(DateTimeInterface::ATOM),
+            'publishedAt' => $this->formatDate($page->publishedAt),
             'holdPublication' => $page->isHoldPublication(),
-            'holdPublicationAt' => $page->holdPublicationAt?->format(DateTimeInterface::ATOM),
+            'holdPublicationAt' => $this->formatDate($page->holdPublicationAt),
             'mainImage' => $page->getMainImage()?->getFileName(),
             'parentPage' => $page->parentPage?->slug,
             'variantOf' => $page->variantOf?->slug,
@@ -265,6 +268,14 @@ final readonly class PageFrontmatterMapper
         }
     }
 
+    /**
+     * On the editors' clock, like the flat files: the offset keeps the instant.
+     */
+    private function formatDate(?DateTimeInterface $date): ?string
+    {
+        return null === $date ? null : $this->editorialTimezone->format($date, DateTimeInterface::ATOM);
+    }
+
     private function parseDateTime(mixed $value, string $key): ?DateTimeInterface
     {
         if (null === $value || '' === $value) {
@@ -278,7 +289,7 @@ final readonly class PageFrontmatterMapper
         try {
             // Reuse the flat sync's parser so the API accepts the same date
             // formats and `draft` sentinel as the on-disk frontmatter.
-            $parsed = PublishedAtConverter::fromFlatValue($value);
+            $parsed = $this->publishedAtConverter->fromFlatValue($value);
         } catch (Exception) {
             // A typo'd date must 422, not silently null the column: for
             // publishedAt a swallowed error would unpublish the page.
