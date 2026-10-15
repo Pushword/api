@@ -7,12 +7,15 @@ namespace Pushword\Api\Tests\Controller;
 use Doctrine\ORM\EntityManagerInterface;
 use Override;
 use PHPUnit\Framework\Attributes\Group;
+use Pushword\Api\Controller\MediaApiController;
 use Pushword\Core\Entity\Media;
 use Pushword\Core\Entity\User;
 use Pushword\Core\Image\License\MediaLicense;
+use Pushword\Core\Tests\Media\Policy\MediaPolicyFixture;
 use Symfony\Bundle\FrameworkBundle\KernelBrowser;
 use Symfony\Bundle\FrameworkBundle\Test\WebTestCase;
 use Symfony\Component\HttpFoundation\File\UploadedFile;
+use Symfony\Component\HttpFoundation\Request;
 use Symfony\Component\HttpFoundation\Response;
 
 #[Group('integration')]
@@ -225,6 +228,136 @@ final class MediaApiControllerTest extends WebTestCase
         $this->requestJson('PATCH', '/api/media/'.$fileName, ['licenseState' => 'seeded']);
 
         self::assertSame(MediaLicense::STATE_NONE, $this->decode()['licenseState']);
+    }
+
+    // --- An app's media rules (MediaPolicyFixture) ---
+
+    /** The name the API is asked to store the file under is what the rule judges. */
+    public function testAnUploadAnAppRuleRefusesIsNotCreated(): void
+    {
+        $fileName = MediaPolicyFixture::REJECTED.'-'.uniqid().'.jpg';
+        $path = sys_get_temp_dir().'/api-policy-'.uniqid().'.jpg';
+        $gd = imagecreatetruecolor(3, 2);
+        self::assertNotFalse($gd);
+        // Random, so the duplicate check never answers in the rule's place.
+        imagesetpixel($gd, 0, 0, random_int(1, 0xFFFFFF));
+        imagejpeg($gd, $path);
+
+        $this->client->request('POST', '/api/media/'.$fileName, [], [
+            'file' => new UploadedFile($path, 'photo.jpg', 'image/jpeg', null, true),
+        ], ['HTTP_AUTHORIZATION' => 'Bearer '.$this->testToken]);
+
+        self::assertSame(Response::HTTP_UNPROCESSABLE_ENTITY, $this->client->getResponse()->getStatusCode());
+        $data = $this->decode();
+        self::assertSame('validation', $data['error']);
+        self::assertIsArray($data['violations']);
+        $violation = $data['violations'][0] ?? null;
+        self::assertIsArray($violation);
+        self::assertSame(MediaPolicyFixture::MESSAGE, $violation['message'] ?? null);
+        self::assertNull($this->em->getRepository(Media::class)->findOneBy(['fileName' => $fileName]));
+    }
+
+    public function testAMetadataEditAnAppRuleRefusesIsNotSaved(): void
+    {
+        $fileName = 'zz-policy-'.uniqid().'.jpg';
+        $this->createMedia($fileName, 'Before');
+
+        $response = $this->requestJson('PATCH', '/api/media/'.$fileName, ['alt' => MediaPolicyFixture::REJECTED]);
+
+        self::assertSame(Response::HTTP_UNPROCESSABLE_ENTITY, $response->getStatusCode());
+        $this->em->clear();
+        self::assertSame('Before', $this->em->getRepository(Media::class)->findOneBy(['fileName' => $fileName])?->getAlt());
+    }
+
+    /** Rotation rewrites the file at once, so a refused request must stop before it. */
+    public function testARefusedEditLeavesTheImageUnrotated(): void
+    {
+        $fileName = 'zz-policy-rotate-'.uniqid().'.jpg';
+        $media = $this->createRealImageMedia($fileName, 6, 3);
+
+        $response = $this->requestJson('PATCH', '/api/media/'.$fileName, [
+            'alt' => MediaPolicyFixture::REJECTED,
+            'rotate' => 90,
+        ]);
+
+        self::assertSame(Response::HTTP_UNPROCESSABLE_ENTITY, $response->getStatusCode());
+        $size = getimagesize($media->getPath());
+        self::assertNotFalse($size);
+        self::assertSame(6, $size[0]);
+    }
+
+    /**
+     * The rotation waits for the flush: a rename in the same request moves the file
+     * there, and rotating first would read a name not yet on disk.
+     */
+    public function testRenamingAndRotatingInOneRequest(): void
+    {
+        $fileName = 'zz-rename-rotate-'.uniqid().'.jpg';
+        $renamed = 'zz-renamed-rotated-'.uniqid().'.jpg';
+        $this->createRealImageMedia($fileName, 6, 3);
+        $this->createdMediaFileNames[] = $renamed;
+
+        $response = $this->requestJson('PATCH', '/api/media/'.$fileName, ['filename' => $renamed, 'rotate' => 90]);
+
+        self::assertSame(Response::HTTP_OK, $response->getStatusCode(), (string) $response->getContent());
+        $size = getimagesize(self::getContainer()->getParameter('pw.media_dir').'/'.$renamed);
+        self::assertNotFalse($size);
+        self::assertSame([3, 6], [$size[0], $size[1]]);
+    }
+
+    /**
+     * An app may call the controller several times within one request, on one entity
+     * manager — upload, re-upload of the same bytes, then a metadata edit — so the
+     * last call meets the very instance the upload stored, still holding a file it
+     * cannot read. The HTTP client resets Doctrine between requests and would hide it.
+     */
+    public function testAnUploadThenAnEditInTheSameRequest(): void
+    {
+        $fileName = 'zz-same-request-'.uniqid().'.png';
+        $this->createdMediaFileNames[] = $fileName;
+        $controller = self::getContainer()->get(MediaApiController::class);
+
+        $image = imagecreatetruecolor(3, 2);
+        self::assertNotFalse($image);
+        imagesetpixel($image, 0, 0, random_int(1, 0xFFFFFF));
+        $original = sys_get_temp_dir().'/same-request-'.uniqid().'.png';
+        imagepng($image, $original);
+
+        foreach ([Response::HTTP_CREATED, Response::HTTP_OK] as $expectedStatus) {
+            $copy = $original.'-'.$expectedStatus;
+            copy($original, $copy);
+            $upload = Request::create('/api/media/'.$fileName, 'POST', files: [
+                'file' => new UploadedFile($copy, $fileName, 'image/png', null, true),
+            ]);
+            self::assertSame($expectedStatus, $controller->item($fileName, $upload)->getStatusCode());
+        }
+
+        $edit = Request::create(
+            '/api/media/'.$fileName,
+            'PATCH',
+            server: ['CONTENT_TYPE' => 'application/json'],
+            content: '{"alt": "Edited in the same request"}',
+        );
+        $response = $controller->item($fileName, $edit);
+
+        self::assertSame(Response::HTTP_OK, $response->getStatusCode(), (string) $response->getContent());
+        $this->em->clear();
+        self::assertSame('Edited in the same request', $this->em->getRepository(Media::class)->findOneBy(['fileName' => $fileName])?->getAlt());
+    }
+
+    public function testADeleteAListenerVetoesKeepsTheMedia(): void
+    {
+        $fileName = MediaPolicyFixture::LOCKED.'-'.uniqid().'.jpg';
+        $this->createMedia($fileName, 'Locked');
+
+        $response = $this->request('DELETE', '/api/media/'.$fileName);
+
+        self::assertSame(Response::HTTP_CONFLICT, $response->getStatusCode());
+        $data = $this->decode();
+        self::assertSame(MediaPolicyFixture::LOCK_REASON, $data['error']);
+        self::assertSame([MediaPolicyFixture::LOCK_REASON], $data['reasons']);
+        $this->em->clear();
+        self::assertNotNull($this->em->getRepository(Media::class)->findOneBy(['fileName' => $fileName]));
     }
 
     /**
